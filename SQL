@@ -1,0 +1,285 @@
+-- fact_transactions
+CREATE TABLE fact_transactions (
+    order_id                        TEXT,
+    customer_id                     TEXT,
+    order_status                    TEXT,
+    order_purchase_timestamp        TIMESTAMP,
+    order_approved_at               TIMESTAMP,
+    order_delivered_carrier_date    TIMESTAMP,
+    order_delivered_customer_date   TIMESTAMP,
+    order_estimated_delivery_date   TIMESTAMP,
+    delivery_delay_days             FLOAT,
+    is_late                         BOOLEAN,
+    customer_unique_id              TEXT,
+    customer_zip_code_prefix        TEXT,
+    customer_city                   TEXT,
+    customer_state                  TEXT,
+    order_value                     FLOAT,
+    freight_value                   FLOAT,
+    item_count                      INTEGER,
+    product_id                      TEXT,
+    seller_id                       TEXT,
+    payment_value                   FLOAT,
+    payment_type                    TEXT,
+    payment_installments            INTEGER,
+    review_score                    FLOAT,
+    product_category_name_english   TEXT,
+    order_year                      INTEGER,
+    order_month                     INTEGER,
+    order_quarter                   INTEGER,
+    order_dow                       TEXT,
+    order_week                      INTEGER,
+    total_revenue                   FLOAT
+);
+
+-- dim_customers
+CREATE TABLE dim_customers (
+    customer_unique_id  TEXT,
+    recency             INTEGER,
+    frequency           INTEGER,
+    monetary            FLOAT,
+    R_score             INTEGER,
+    F_score             INTEGER,
+    M_score             INTEGER,
+    RFM_score           TEXT,
+    segment             TEXT
+);
+
+-- fact_marketing_spend
+CREATE TABLE fact_marketing_spend (
+    date                DATE,
+    channel             TEXT,
+    spend               FLOAT,
+    impressions         INTEGER,
+    clicks              INTEGER,
+    conversions         INTEGER,
+    revenue_attributed  FLOAT,
+    ctr                 FLOAT,
+    conversion_rate     FLOAT,
+    cpc                 FLOAT,
+    roas                FLOAT
+);
+
+-- dim_date
+CREATE TABLE dim_date (
+    date            DATE,
+    year            INTEGER,
+    month           INTEGER,
+    month_name      TEXT,
+    quarter         INTEGER,
+    week            INTEGER,
+    day_of_week     INTEGER,
+    day_name        TEXT,
+    is_weekend      BOOLEAN,
+    is_peak_season  BOOLEAN
+);
+
+SELECT 'fact_transactions'    AS table_name, COUNT(*) AS rows FROM fact_transactions
+UNION ALL
+SELECT 'dim_customers',                       COUNT(*) FROM dim_customers
+UNION ALL
+SELECT 'fact_marketing_spend',                COUNT(*) FROM fact_marketing_spend
+UNION ALL
+SELECT 'dim_date',                            COUNT(*) FROM dim_date;
+
+-- View 1: Channel performance by month
+CREATE OR REPLACE VIEW v_channel_performance AS
+SELECT
+    DATE_TRUNC('month', date)                                AS month,
+    channel,
+    SUM(spend)                                               AS total_spend,
+    SUM(revenue_attributed)                                  AS total_revenue, -- Changed this line
+    SUM(impressions)                                         AS total_impressions,
+    SUM(clicks)                                              AS total_clicks,
+    SUM(conversions)                                         AS total_conversions,
+    -- Updated the ROAS calculation below as well
+    ROUND(CAST(SUM(revenue_attributed) / NULLIF(SUM(spend), 0) AS NUMERIC), 2)          AS roas,
+    ROUND(CAST(SUM(spend) / NULLIF(SUM(conversions), 0) AS NUMERIC), 2)                  AS cac,
+    ROUND(CAST(SUM(clicks)::NUMERIC / NULLIF(SUM(impressions), 0) * 100 AS NUMERIC), 2) AS ctr
+FROM fact_marketing_spend
+GROUP BY DATE_TRUNC('month', date), channel;
+
+
+-- View 2: Customer segment summary
+CREATE OR REPLACE VIEW v_customer_segments AS
+SELECT
+    dc.segment,
+    COUNT(DISTINCT ft.customer_unique_id)                       AS customer_count,
+    ROUND(CAST(AVG(dc.recency) AS NUMERIC), 1)                 AS avg_recency_days,
+    ROUND(CAST(AVG(dc.frequency) AS NUMERIC), 2)               AS avg_frequency,
+    ROUND(CAST(AVG(dc.monetary) AS NUMERIC), 2)                AS avg_monetary,
+    ROUND(CAST(SUM(ft.total_revenue) AS NUMERIC), 2)           AS total_revenue,
+    ROUND(CAST(AVG(ft.review_score) AS NUMERIC), 2)            AS avg_review_score
+FROM dim_customers dc
+LEFT JOIN fact_transactions ft
+    ON dc.customer_unique_id = ft.customer_unique_id
+GROUP BY dc.segment;
+
+-- View 3: Cohort retention
+CREATE OR REPLACE VIEW v_cohort_retention AS
+WITH first_purchase AS (
+    SELECT
+        customer_unique_id,
+        DATE_TRUNC('month', MIN(order_purchase_timestamp)) AS cohort_month
+    FROM fact_transactions
+    GROUP BY customer_unique_id
+),
+order_months AS (
+    SELECT
+        ft.customer_unique_id,
+        DATE_TRUNC('month', ft.order_purchase_timestamp)        AS order_month,
+        fp.cohort_month,
+        ROUND(EXTRACT(EPOCH FROM (
+            DATE_TRUNC('month', ft.order_purchase_timestamp) - fp.cohort_month
+        )) / 2592000)                                           AS month_number
+    FROM fact_transactions ft
+    JOIN first_purchase fp
+        ON ft.customer_unique_id = fp.customer_unique_id
+)
+SELECT
+    cohort_month,
+    month_number,
+    COUNT(DISTINCT customer_unique_id) AS customers
+FROM order_months
+GROUP BY cohort_month, month_number
+ORDER BY cohort_month, month_number;
+
+-- View 4: ROAS anomaly detection
+CREATE OR REPLACE VIEW v_campaign_anomalies AS
+WITH monthly_roas AS (
+    SELECT
+        DATE_TRUNC('month', date)                                                         AS month,
+        channel,
+        -- Swapped to revenue_attributed here:
+        ROUND(CAST(SUM(revenue_attributed) / NULLIF(SUM(spend), 0) AS NUMERIC), 2)         AS roas,
+        ROUND(CAST(SUM(spend) AS NUMERIC), 2)                                             AS total_spend
+    FROM fact_marketing_spend
+    GROUP BY DATE_TRUNC('month', date), channel
+),
+with_lag AS (
+    SELECT *,
+        LAG(roas) OVER (PARTITION BY channel ORDER BY month) AS prev_month_roas
+    FROM monthly_roas
+)
+SELECT *,
+    ROUND(CAST((roas - prev_month_roas) / NULLIF(prev_month_roas, 0) * 100 AS NUMERIC), 1) AS roas_change_pct,
+    CASE
+        WHEN (roas - prev_month_roas) / NULLIF(prev_month_roas, 0) < -0.20
+        THEN TRUE ELSE FALSE
+    END AS is_anomaly
+FROM with_lag
+WHERE prev_month_roas IS NOT NULL
+ORDER BY month, channel;
+
+
+
+
+-- This removes the views temporarily so Python can swap the tables
+DROP VIEW IF EXISTS v_channel_performance CASCADE;
+DROP VIEW IF EXISTS v_customer_segments CASCADE;
+DROP VIEW IF EXISTS v_cohort_retention CASCADE;
+DROP VIEW IF EXISTS v_campaign_anomalies CASCADE;
+
+-- Also, manually drop the tables once with CASCADE to be sure they are gone
+DROP TABLE IF EXISTS fact_transactions CASCADE;
+DROP TABLE IF EXISTS fact_marketing_spend CASCADE;
+DROP TABLE IF EXISTS dim_customers CASCADE;
+DROP TABLE IF EXISTS dim_date CASCADE;
+DROP TABLE IF EXISTS bridge_customer_attribution CASCADE;
+
+
+-- View 1: Channel Performance
+CREATE OR REPLACE VIEW v_channel_performance AS
+SELECT
+    DATE_TRUNC('month', date)                                AS month,
+    channel,
+    SUM(spend)                                               AS total_spend,
+    SUM(revenue_attributed)                                  AS total_revenue, 
+    SUM(impressions)                                         AS total_impressions,
+    SUM(clicks)                                              AS total_clicks,
+    SUM(conversions)                                         AS total_conversions,
+    ROUND(CAST(SUM(revenue_attributed) / NULLIF(SUM(spend), 0) AS NUMERIC), 2)          AS roas,
+    ROUND(CAST(SUM(spend) / NULLIF(SUM(conversions), 0) AS NUMERIC), 2)                  AS cac,
+    ROUND(CAST(SUM(clicks)::NUMERIC / NULLIF(SUM(impressions), 0) * 100 AS NUMERIC), 2) AS ctr
+FROM fact_marketing_spend
+GROUP BY DATE_TRUNC('month', date), channel;
+
+-- View 2: Customer Segments
+CREATE OR REPLACE VIEW v_customer_segments AS
+SELECT
+    dc.segment,
+    COUNT(DISTINCT ft.customer_unique_id)                       AS customer_count,
+    ROUND(CAST(AVG(dc.recency) AS NUMERIC), 1)                  AS avg_recency_days,
+    ROUND(CAST(AVG(dc.frequency) AS NUMERIC), 2)                AS avg_frequency,
+    ROUND(CAST(AVG(dc.monetary) AS NUMERIC), 2)                 AS avg_monetary,
+    ROUND(CAST(SUM(ft.total_revenue) AS NUMERIC), 2)            AS total_revenue,
+    ROUND(CAST(AVG(ft.review_score) AS NUMERIC), 2)             AS avg_review_score
+FROM dim_customers dc
+LEFT JOIN fact_transactions ft
+    ON dc.customer_unique_id = ft.customer_unique_id
+GROUP BY dc.segment;
+
+-- View 3: Cohort Retention
+CREATE OR REPLACE VIEW v_cohort_retention AS
+WITH first_purchase AS (
+    SELECT
+        customer_unique_id,
+        -- Added ::TIMESTAMP here to fix the error:
+        DATE_TRUNC('month', MIN(order_purchase_timestamp::TIMESTAMP)) AS cohort_month
+    FROM fact_transactions
+    GROUP BY customer_unique_id
+),
+order_months AS (
+    SELECT
+        ft.customer_unique_id,
+        -- Added ::TIMESTAMP here as well:
+        DATE_TRUNC('month', ft.order_purchase_timestamp::TIMESTAMP)        AS order_month,
+        fp.cohort_month,
+        ROUND(EXTRACT(EPOCH FROM (
+            DATE_TRUNC('month', ft.order_purchase_timestamp::TIMESTAMP) - fp.cohort_month
+        )) / 2592000)                                                      AS month_number
+    FROM fact_transactions ft
+    JOIN first_purchase fp
+        ON ft.customer_unique_id = fp.customer_unique_id
+)
+SELECT
+    cohort_month,
+    month_number,
+    COUNT(DISTINCT customer_unique_id) AS customers
+FROM order_months
+GROUP BY cohort_month, month_number
+ORDER BY cohort_month, month_number;
+
+-- View 4: Anomaly Detection
+CREATE OR REPLACE VIEW v_campaign_anomalies AS
+WITH monthly_roas AS (
+    SELECT
+        DATE_TRUNC('month', date)                                                         AS month,
+        channel,
+        ROUND(CAST(SUM(revenue_attributed) / NULLIF(SUM(spend), 0) AS NUMERIC), 2)         AS roas,
+        ROUND(CAST(SUM(spend) AS NUMERIC), 2)                                             AS total_spend
+    FROM fact_marketing_spend
+    GROUP BY DATE_TRUNC('month', date), channel
+),
+with_lag AS (
+    SELECT *,
+        LAG(roas) OVER (PARTITION BY channel ORDER BY month) AS prev_month_roas
+    FROM monthly_roas
+)
+SELECT *,
+    ROUND(CAST((roas - prev_month_roas) / NULLIF(prev_month_roas, 0) * 100 AS NUMERIC), 1) AS roas_change_pct,
+    CASE
+        WHEN (roas - prev_month_roas) / NULLIF(prev_month_roas, 0) < -0.20
+        THEN TRUE ELSE FALSE
+    END AS is_anomaly
+FROM with_lag
+WHERE prev_month_roas IS NOT NULL
+ORDER BY month, channel;
+
+SELECT 'Channel Performance' AS view_name, COUNT(*) AS row_count FROM v_channel_performance
+UNION ALL
+SELECT 'Customer Segments', COUNT(*) FROM v_customer_segments
+UNION ALL
+SELECT 'Cohort Retention', COUNT(*) FROM v_cohort_retention
+UNION ALL
+SELECT 'Campaign Anomalies', COUNT(*) FROM v_campaign_anomalies;
