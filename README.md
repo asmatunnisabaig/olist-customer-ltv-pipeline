@@ -9,7 +9,8 @@ To transform raw marketplace data into an actionable strategic growth engine. Th
 * **True Average Customer LTV:** $232.28  
 * **True Total Attributed Revenue:** $15,489,522.09  
 * **Total Global Marketing Spend:** $634,503.28  
-* **True Global ROAS:** 24.41x (2,441.20%)  
+* **True Global ROAS:** 24.41x (2,441.20%)
+
 
 ---
 
